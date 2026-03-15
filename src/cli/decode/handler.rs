@@ -3,6 +3,8 @@ use crate::cli::command::OutputBackend;
 use crate::events::{Configuration, Event};
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
 use audio_output::pipewire::{PipewireAdaptiveResamplingConfig, PipewireBufferConfig};
+#[cfg(all(target_os = "windows", feature = "asio"))]
+use audio_output::AdaptiveResamplingConfig;
 use bridge_api::{RChannelLabel, RCoordinateFormat, RDecodedFrame, RMetadataFrame};
 
 use anyhow::{Result, anyhow};
@@ -477,6 +479,8 @@ pub struct RuntimeOutputState {
     pub pw_adaptive_config: PipewireAdaptiveResamplingConfig,
     #[cfg(all(target_os = "windows", feature = "asio"))]
     pub asio_device_name: Option<String>,
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    pub asio_adaptive_config: AdaptiveResamplingConfig,
     /// Works for both ASIO (Windows) and PipeWire (Linux)
     pub output_sample_rate: Option<u32>,
     pub enable_adaptive_resampling: bool,
@@ -493,6 +497,8 @@ impl Default for RuntimeOutputState {
             pw_adaptive_config: PipewireAdaptiveResamplingConfig::default(),
             #[cfg(all(target_os = "windows", feature = "asio"))]
             asio_device_name: None,
+            #[cfg(all(target_os = "windows", feature = "asio"))]
+            asio_adaptive_config: AdaptiveResamplingConfig::default(),
             output_sample_rate: None,
             enable_adaptive_resampling: false,
         }
@@ -1295,7 +1301,7 @@ impl DecodeHandler {
                     channel_count as u32,
                     self.runtime.asio_device_name.clone(),
                     self.runtime.enable_adaptive_resampling,
-                    self.runtime.pw_adaptive_config.clone(),
+                    self.runtime.asio_adaptive_config.clone(),
                 )?)
             }
             OutputBackend::Unsupported => Err(anyhow!("No supported realtime output backend")),
