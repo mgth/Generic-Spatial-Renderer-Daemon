@@ -5,7 +5,7 @@ use crate::events::{Configuration, Event};
 use audio_output::pipewire::{PipewireAdaptiveResamplingConfig, PipewireBufferConfig};
 use bridge_api::{RChannelLabel, RCoordinateFormat, RDecodedFrame, RMetadataFrame};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use log::Level;
 use renderer::metering::AudioMeter;
 use renderer::osc_output::{ObjectMeta, OscSender};
@@ -1295,6 +1295,7 @@ impl DecodeHandler {
                     channel_count as u32,
                     self.runtime.asio_device_name.clone(),
                     self.runtime.enable_adaptive_resampling,
+                    self.runtime.pw_adaptive_config.clone(),
                 )?)
             }
             OutputBackend::Unsupported => Err(anyhow!("No supported realtime output backend")),

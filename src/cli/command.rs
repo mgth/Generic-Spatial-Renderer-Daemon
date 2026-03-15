@@ -205,7 +205,11 @@ pub struct RenderArgs {
     pub vbap_distance_res: i32,
 
     /// Maximum distance covered by polar VBAP precomputed table
-    #[arg(long = "vbap-distance-max", value_name = "DISTANCE", default_value_t = 2.0)]
+    #[arg(
+        long = "vbap-distance-max",
+        value_name = "DISTANCE",
+        default_value_t = 2.0
+    )]
     pub vbap_distance_max: f32,
 
     /// VBAP pre-computed table mode.

@@ -68,7 +68,7 @@ use crate::live_params::{
     LiveParams, LiveVbapTableMode, RenderTopology, RendererControl, VbapBackendMode,
 };
 use crate::spatial_vbap::VbapTableMode;
-use crate::spatial_vbap::{adm_to_spherical, DistanceModel, VbapPanner};
+use crate::spatial_vbap::{DistanceModel, VbapPanner, adm_to_spherical};
 use crate::speaker_layout::SpeakerLayout;
 use anyhow::Result;
 use std::sync::Arc;
@@ -758,8 +758,7 @@ impl SpatialRenderer {
             vbap_polar_azimuth_values: (360.0 / az_res_deg.max(1) as f32).round() as i32,
             vbap_polar_elevation_values: (((if allow_negative_z { 180.0 } else { 90.0 })
                 / el_res_deg.max(1) as f32)
-                .round()
-                as i32),
+                .round() as i32),
             vbap_polar_distance_res: (distance_max / distance_res.max(0.01)).round() as i32,
             vbap_polar_distance_max: distance_max.max(0.01),
             use_loudness,
@@ -1250,13 +1249,12 @@ impl SpatialRenderer {
                                     .iter()
                                     .enumerate()
                                     .map(|(idx, g)| {
-                                        let speaker_idx = if let Some(mapping) =
-                                            active_vbap_to_speaker_mapping
-                                        {
-                                            mapping[idx]
-                                        } else {
-                                            idx // v4: direct mapping
-                                        };
+                                        let speaker_idx =
+                                            if let Some(mapping) = active_vbap_to_speaker_mapping {
+                                                mapping[idx]
+                                            } else {
+                                                idx // v4: direct mapping
+                                            };
                                         format!("{}={:.3}", active_speaker_names[speaker_idx], g)
                                     })
                                     .collect();

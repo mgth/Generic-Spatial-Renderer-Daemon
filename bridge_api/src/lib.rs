@@ -1,12 +1,11 @@
 #![allow(non_local_definitions)]
 
 use abi_stable::{
-    declare_root_module_statics,
+    StableAbi, declare_root_module_statics,
     library::RootModule,
     package_version_strings, sabi_trait,
     sabi_types::VersionStrings,
     std_types::{RBox, ROption, RSlice, RStr, RString, RVec},
-    StableAbi,
 };
 
 /// Transport wrapper used for the incoming bytes passed to a bridge.

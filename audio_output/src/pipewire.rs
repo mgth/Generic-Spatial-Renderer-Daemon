@@ -1,18 +1,23 @@
 #![cfg(all(target_os = "linux", feature = "pipewire"))]
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use crossbeam::queue::ArrayQueue;
 use pipewire as pw;
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::{
+    ADAPTIVE_BAND_FAR, ADAPTIVE_BAND_HARD, ADAPTIVE_BAND_NEAR, AdaptiveControllerState,
+    AdaptiveResamplingConfig, apply_ema, compute_adaptive_step,
+};
 
 // FFI bindings for PipeWire thread-safe rate control and stream timing
 #[link(name = "pipewire-0.3")]
@@ -119,49 +124,8 @@ impl Default for PipewireBufferConfig {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PipewireAdaptiveResamplingConfig {
-    pub kp_near: f64,
-    pub kp_far: f64,
-    pub ki: f64,
-    pub max_adjust: f64,
-    pub max_adjust_far: f64,
-    pub near_far_threshold_ms: u32,
-    pub hard_correction_threshold_ms: u32,
-    pub measurement_smoothing_alpha: f64,
-}
+pub type PipewireAdaptiveResamplingConfig = AdaptiveResamplingConfig;
 
-impl Default for PipewireAdaptiveResamplingConfig {
-    fn default() -> Self {
-        Self {
-            kp_near: RATE_ADJUST_P_GAIN,
-            kp_far: RATE_ADJUST_P_GAIN * 2.0,
-            ki: RATE_ADJUST_I_GAIN,
-            max_adjust: MAX_RATE_ADJUST,
-            max_adjust_far: MAX_RATE_ADJUST,
-            near_far_threshold_ms: 120,
-            hard_correction_threshold_ms: 0,
-            measurement_smoothing_alpha: BUFFER_MEASUREMENT_EMA_ALPHA,
-        }
-    }
-}
-
-// Proportional gain: rate change per sample of buffer drift.
-// Effective value = P_GAIN / 100.  Saturation threshold (where P alone reaches MAX_RATE_ADJUST):
-//   drift_sat = MAX_RATE_ADJUST * 100 / P_GAIN
-// At 48 kHz, 8ch: 1 ms = 384 samples.  We want saturation at ≈ 260 ms → 100 000 samples.
-//   P_GAIN = 0.002 * 100 / 100 000 = 2e-6
-const RATE_ADJUST_P_GAIN: f64 = 0.00001;
-
-// Integral gain: corrects steady-state clock mismatch between input and output clocks.
-// Keep small enough that a transient burst does not permanently wind up the integrator.
-// At anti-windup limit (MAX_INTEGRAL_TERM / I_GAIN = 2000 samples), the I term adds 200 ppm.
-const RATE_ADJUST_I_GAIN: f64 = 0.0000005;
-
-// Maximum rate adjustment: ±0.2% (±2000 ppm).
-// Real-world clock drift between two independent audio clocks is at most a few hundred ppm.
-// Staying below ±0.5% keeps pitch deviation imperceptible (<5 cents).
-const MAX_RATE_ADJUST: f64 = 0.01;
 // Small always-on PipeWire latency servo used even when user-facing adaptive
 // resampling is disabled. The goal is not aggressive correction, only holding
 // the ring buffer close to the requested latency target without audible glitches.
@@ -172,8 +136,6 @@ const LATENCY_SERVO_MAX_RATE_ADJUST: f64 = 0.03;
 // Maximum I contribution: 200 ppm.  Keeps the integral from dominating when the buffer
 // sits above target for a while (e.g. during initial mpv burst fill).
 const MAX_INTEGRAL_TERM: f64 = 0.0002;
-const BUFFER_MEASUREMENT_EMA_ALPHA: f64 = 0.15;
-
 // Rubato resampler constants
 const RESAMPLER_CHUNK_SIZE: usize = 1024; // Input chunk size for resampler
 
@@ -780,11 +742,9 @@ fn run_pipewire_loop(
     let mut prefill_stable_callbacks = 0u32;
     let mut last_prefill_available = 0usize;
     let mut underrun_warned = false;
-    let mut accumulated_drift = 0.0f64; // Integral term state
+    let mut controller_state = AdaptiveControllerState::default();
     // -1 = hard underfill recovery (zero-fill), 1 = hard overfill recovery (drop), 0 = inactive.
     let mut hard_correction_mode = 0i8;
-    let mut filtered_control_available: Option<f64> = None;
-    let mut filtered_total_available: Option<f64> = None;
 
     // Compute channel-aware buffer thresholds for the callback (ms → frames → samples).
     // IMPORTANT: these thresholds are compared against `buffer_for_callback.len()`, which
@@ -884,15 +844,13 @@ fn run_pipewire_loop(
                         playback_state = PlaybackState::Prefill;
                         prefill_stable_callbacks = 0;
                         last_prefill_available = 0;
-                        accumulated_drift = 0.0;
+                        controller_state = AdaptiveControllerState::default();
                         desired_rate_for_callback.store(1.0f32.to_bits(), Ordering::Relaxed);
                         rate_adjust_for_callback.store(1.0f32.to_bits(), Ordering::Relaxed);
                         underrun_warned = false;
                         output_fifo.clear();
                         input_frames_collected = 0;
                         flush_requested_for_callback.store(false, Ordering::Relaxed);
-                        filtered_control_available = None;
-                        filtered_total_available = None;
                         control_latency_for_callback.store(0u32, Ordering::Relaxed);
                         log::info!("PipeWire: seek flush complete, waiting for buffer prefill");
                     }
@@ -917,22 +875,20 @@ fn run_pipewire_loop(
                     let control_available =
                         available.saturating_sub(frame_aligned_max / 2);
                     let total_available = available.saturating_add(output_fifo.len());
-                    let smoothed_control_available = {
-                        let prev = filtered_control_available.unwrap_or(control_available as f64);
-                        let next = prev
-                            + measurement_smoothing_alpha
-                                * (control_available as f64 - prev);
-                        filtered_control_available = Some(next);
-                        next.max(0.0).round() as usize
-                    };
-                    let smoothed_total_available = {
-                        let prev = filtered_total_available.unwrap_or(total_available as f64);
-                        let next = prev
-                            + measurement_smoothing_alpha
-                                * (total_available as f64 - prev);
-                        filtered_total_available = Some(next);
-                        next.max(0.0).round() as usize
-                    };
+                    let smoothed_control_available = apply_ema(
+                        &mut controller_state.smoothed_control_available,
+                        control_available as f64,
+                        measurement_smoothing_alpha,
+                    )
+                    .max(0.0)
+                    .round() as usize;
+                    let smoothed_total_available = apply_ema(
+                        &mut controller_state.smoothed_total_available,
+                        total_available as f64,
+                        measurement_smoothing_alpha,
+                    )
+                    .max(0.0)
+                    .round() as usize;
                     let control_latency_ms = (smoothed_control_available as f32
                         / channel_count as f32
                         / sample_rate as f32)
@@ -997,12 +953,12 @@ fn run_pipewire_loop(
                                 {
                                     hard_correction_mode = 0;
                                 } else {
-                                    accumulated_drift = 0.0;
+                                    controller_state.accumulated_drift = 0.0;
                                     rate_adjust_for_callback
                                         .store(1.0f32.to_bits(), Ordering::Relaxed);
                                     desired_rate_for_callback
                                         .store(1.0f32.to_bits(), Ordering::Relaxed);
-                                    current_adaptive_band.store(3, Ordering::Relaxed);
+                                    current_adaptive_band.store(ADAPTIVE_BAND_HARD, Ordering::Relaxed);
                                     hard_zero_fill = true;
                                 }
                             } else if hard_correction_mode > 0 {
@@ -1023,8 +979,8 @@ fn run_pipewire_loop(
                                     for _ in 0..ring_drop {
                                         let _ = buffer_for_callback.pop();
                                     }
-                                    accumulated_drift = 0.0;
-                                    current_adaptive_band.store(3, Ordering::Relaxed);
+                                    controller_state.accumulated_drift = 0.0;
+                                    current_adaptive_band.store(ADAPTIVE_BAND_HARD, Ordering::Relaxed);
                                     log::debug!(
                                         "PipeWire hard correction: overfill total={} target={} threshold={} -> drop fifo={} ring={}",
                                         smoothed_total_available,
@@ -1039,12 +995,12 @@ fn run_pipewire_loop(
                                 < runtime_target_buffer_fill
                             {
                                 hard_correction_mode = -1;
-                                accumulated_drift = 0.0;
+                                controller_state.accumulated_drift = 0.0;
                                 rate_adjust_for_callback
                                     .store(1.0f32.to_bits(), Ordering::Relaxed);
                                 desired_rate_for_callback
                                     .store(1.0f32.to_bits(), Ordering::Relaxed);
-                                current_adaptive_band.store(3, Ordering::Relaxed);
+                                current_adaptive_band.store(ADAPTIVE_BAND_HARD, Ordering::Relaxed);
                                 hard_zero_fill = true;
                                 log::debug!(
                                     "PipeWire hard correction: underfill buf={} target={} threshold={} -> zero-fill",
@@ -1072,8 +1028,8 @@ fn run_pipewire_loop(
                                 for _ in 0..ring_drop {
                                     let _ = buffer_for_callback.pop();
                                 }
-                                accumulated_drift = 0.0;
-                                current_adaptive_band.store(3, Ordering::Relaxed);
+                                controller_state.accumulated_drift = 0.0;
+                                current_adaptive_band.store(ADAPTIVE_BAND_HARD, Ordering::Relaxed);
                                     log::debug!(
                                         "PipeWire hard correction: overfill total={} target={} threshold={} -> drop fifo={} ring={}",
                                         smoothed_total_available,
@@ -1093,49 +1049,24 @@ fn run_pipewire_loop(
                         } else if let Some(ref mut resampler) = resampler_opt {
                             // Adaptive rate matching with resampler
                             if adaptive_resampling_enabled && callback_count % 10 == 0 {
-                                let drift =
-                                    smoothed_control_available as i64 - runtime_target_buffer_fill as i64;
-
-                                if drift.abs() > 480 {
-                                    accumulated_drift += drift as f64;
-                                    let integral_contribution =
-                                        accumulated_drift * adaptive_config.ki;
-                                    if integral_contribution.abs() > MAX_INTEGRAL_TERM {
-                                        accumulated_drift = (MAX_INTEGRAL_TERM / adaptive_config.ki)
-                                            * integral_contribution.signum();
-                                    }
-                                }
-
-                                let is_far = (drift.unsigned_abs() as usize) > fast_catchup_threshold;
-                                current_adaptive_band.store(if is_far { 2 } else { 1 }, Ordering::Relaxed);
-                                let p_gain = if is_far {
-                                    adaptive_config.kp_far
-                                } else {
-                                    adaptive_config.kp_near
-                                };
-                                let p_term = drift as f64 * p_gain / 100.0;
-                                let i_term = accumulated_drift * adaptive_config.ki;
-                                let max_adjust = if is_far {
-                                    adaptive_config.max_adjust_far
-                                } else {
-                                    adaptive_config.max_adjust
-                                }
-                                .max(0.000001);
-                                let consume_adjust =
-                                    (1.0 + p_term + i_term).clamp(1.0 - max_adjust, 1.0 + max_adjust);
-                                // SincFixedIn ratio is OUTPUT/INPUT.
-                                // To consume INPUT faster for a fixed output demand, ratio must decrease.
-                                let current_ratio = (resample_ratio / consume_adjust).clamp(
-                                    resample_ratio * (1.0 - max_adjust),
-                                    resample_ratio * (1.0 + max_adjust)
+                                let step = compute_adaptive_step(
+                                    &mut controller_state,
+                                    &adaptive_config,
+                                    smoothed_control_available,
+                                    runtime_target_buffer_fill,
+                                    fast_catchup_threshold,
+                                    resample_ratio,
+                                    480,
+                                    MAX_INTEGRAL_TERM,
                                 );
+                                current_adaptive_band.store(step.band, Ordering::Relaxed);
 
-                                if let Err(e) = resampler.set_resample_ratio(current_ratio, true) as Result<(), rubato::ResampleError> {
+                                if let Err(e) = resampler.set_resample_ratio(step.current_ratio, true) as Result<(), rubato::ResampleError> {
                                     log::warn!("Failed to set resampler ratio: {}", e);
                                 }
 
                                 // Store INPUT consumption adjust factor for OSC monitoring.
-                                let effective_adjust = consume_adjust as f32;
+                                let effective_adjust = step.consume_adjust as f32;
                                 rate_adjust_for_callback.store(effective_adjust.to_bits(), Ordering::Relaxed);
 
                                 if callback_count % 100 == 0 {
@@ -1143,11 +1074,11 @@ fn run_pipewire_loop(
                                         "PipeWire Adaptive: buf={}/{} drift={} ratio={:.6} (base={:.2} P={:.6} I={:.6})",
                                         smoothed_control_available,
                                         runtime_target_buffer_fill,
-                                        drift,
-                                        current_ratio,
+                                        step.drift,
+                                        step.current_ratio,
                                         resample_ratio,
-                                        p_term,
-                                        i_term
+                                        step.p_term,
+                                        step.i_term
                                     );
                                 }
                             }
@@ -1228,22 +1159,23 @@ fn run_pipewire_loop(
                                     smoothed_control_available as i64 - runtime_target_buffer_fill as i64;
 
                                 if drift.abs() > 480 {
-                                    accumulated_drift += drift as f64;
+                                    controller_state.accumulated_drift += drift as f64;
                                     let i_gain = if adaptive_resampling_enabled {
-                                        RATE_ADJUST_I_GAIN
+                                        adaptive_config.ki
                                     } else {
                                         LATENCY_SERVO_I_GAIN
                                     };
-                                    let integral_contribution = accumulated_drift * i_gain;
+                                    let integral_contribution = controller_state.accumulated_drift * i_gain;
                                     if integral_contribution.abs() > MAX_INTEGRAL_TERM {
-                                        accumulated_drift = (MAX_INTEGRAL_TERM / i_gain) * integral_contribution.signum();
+                                        controller_state.accumulated_drift =
+                                            (MAX_INTEGRAL_TERM / i_gain) * integral_contribution.signum();
                                     }
                                 }
 
                                 let is_far = adaptive_resampling_enabled
                                     && (drift.unsigned_abs() as usize) > fast_catchup_threshold;
                                 if adaptive_resampling_enabled {
-                                    current_adaptive_band.store(if is_far { 2 } else { 1 }, Ordering::Relaxed);
+                                    current_adaptive_band.store(if is_far { ADAPTIVE_BAND_FAR } else { ADAPTIVE_BAND_NEAR }, Ordering::Relaxed);
                                 } else {
                                     current_adaptive_band.store(0, Ordering::Relaxed);
                                 }
@@ -1257,12 +1189,12 @@ fn run_pipewire_loop(
                                     LATENCY_SERVO_P_GAIN
                                 };
                                 let i_gain = if adaptive_resampling_enabled {
-                                    RATE_ADJUST_I_GAIN
+                                    adaptive_config.ki
                                 } else {
                                     LATENCY_SERVO_I_GAIN
                                 };
                                 let p_term = drift as f64 * p_gain / 100.0;
-                                let i_term = accumulated_drift * i_gain;
+                                let i_term = controller_state.accumulated_drift * i_gain;
                                 // >1.0 means "consume input faster".
                                 let max_adjust = if adaptive_resampling_enabled {
                                     if is_far {

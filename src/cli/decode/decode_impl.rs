@@ -1,7 +1,7 @@
 use super::decoder_thread::{DecoderMessage, DecoderThreadConfig, spawn_decoder_thread};
 use super::handler::{DecodeHandler, FrameHandlerContext, WriterState};
 use crate::bridge_loader::{LoadedBridge, resolve_bridge_path};
-use crate::cli::command::{Cli, RenderArgs, LogFormat, LogLevel, OutputBackend, VbapTableModeArg};
+use crate::cli::command::{Cli, LogFormat, LogLevel, OutputBackend, RenderArgs, VbapTableModeArg};
 use anyhow::Result;
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
 use audio_output::pipewire::{PipewireAdaptiveResamplingConfig, PipewireBufferConfig};
@@ -240,7 +240,7 @@ fn merge_render_config(cfg: &renderer::config::RenderConfig, args: &mut RenderAr
 }
 
 fn effective_to_config(args: &RenderArgs, cli: &Cli) -> Result<renderer::config::Config> {
-    use renderer::config::{Config, RenderConfig, GlobalConfig};
+    use renderer::config::{Config, GlobalConfig, RenderConfig};
     use renderer::speaker_layout::SpeakerLayout;
 
     let current_layout = if let Some(ref layout_path) = args.speaker_layout {
@@ -445,14 +445,12 @@ fn effective_to_config(args: &RenderArgs, cli: &Cli) -> Result<renderer::config:
         },
     };
 
-    let global_opt = if global.loglevel.is_none()
-        && global.log_format.is_none()
-        && global.strict.is_none()
-    {
-        None
-    } else {
-        Some(global)
-    };
+    let global_opt =
+        if global.loglevel.is_none() && global.log_format.is_none() && global.strict.is_none() {
+            None
+        } else {
+            Some(global)
+        };
 
     Ok(Config {
         global: global_opt,
@@ -895,15 +893,12 @@ fn init_render_handler(
                 let azimuth_cells = args.vbap_azimuth_resolution.max(1);
                 let elevation_cells = args.vbap_elevation_resolution.max(1);
                 let distance_cells = args.vbap_distance_res.max(1);
-                let azimuth_step_deg =
-                    (360.0f32 / (azimuth_cells as f32)).max(1.0).round() as i32;
-                let elevation_step_deg =
-                    (((if vbap_allow_negative_z { 180.0 } else { 90.0 })
-                        / (elevation_cells as f32))
-                        .max(1.0)
-                        .round()) as i32;
-                let distance_step =
-                    args.vbap_distance_max.max(0.01) / (distance_cells as f32);
+                let azimuth_step_deg = (360.0f32 / (azimuth_cells as f32)).max(1.0).round() as i32;
+                let elevation_step_deg = (((if vbap_allow_negative_z { 180.0 } else { 90.0 })
+                    / (elevation_cells as f32))
+                    .max(1.0)
+                    .round()) as i32;
+                let distance_step = args.vbap_distance_max.max(0.01) / (distance_cells as f32);
 
                 let renderer = SpatialRenderer::new(
                     layout,
@@ -950,9 +945,12 @@ fn init_render_handler(
                     } else {
                         renderer::live_params::LiveVbapTableMode::Auto
                     },
-                    args.vbap_cart_x_size.unwrap_or(vbap_cartesian_defaults.x_size as usize),
-                    args.vbap_cart_y_size.unwrap_or(vbap_cartesian_defaults.y_size as usize),
-                    args.vbap_cart_z_size.unwrap_or(vbap_cartesian_defaults.z_size as usize),
+                    args.vbap_cart_x_size
+                        .unwrap_or(vbap_cartesian_defaults.x_size as usize),
+                    args.vbap_cart_y_size
+                        .unwrap_or(vbap_cartesian_defaults.y_size as usize),
+                    args.vbap_cart_z_size
+                        .unwrap_or(vbap_cartesian_defaults.z_size as usize),
                 )?;
 
                 let elapsed = start_time.elapsed();

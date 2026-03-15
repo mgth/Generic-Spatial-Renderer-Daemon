@@ -740,7 +740,12 @@ fn handle_control_message(
         };
         control.set_requested_adaptive_resampling_kp_near(value);
         set_dirty(control, socket, clients);
-        broadcast_float(socket, clients, "/gsrd/state/adaptive_resampling/kp_near", value);
+        broadcast_float(
+            socket,
+            clients,
+            "/gsrd/state/adaptive_resampling/kp_near",
+            value,
+        );
         return;
     }
 
@@ -752,7 +757,12 @@ fn handle_control_message(
         };
         control.set_requested_adaptive_resampling_kp_far(value);
         set_dirty(control, socket, clients);
-        broadcast_float(socket, clients, "/gsrd/state/adaptive_resampling/kp_far", value);
+        broadcast_float(
+            socket,
+            clients,
+            "/gsrd/state/adaptive_resampling/kp_far",
+            value,
+        );
         return;
     }
 
@@ -1025,19 +1035,11 @@ fn handle_control_message(
                 if let Some(res) = res {
                     let state_addr = match rest {
                         "azimuth_resolution" => {
-                            control
-                                .live
-                                .write()
-                                .unwrap()
-                                .vbap_polar_azimuth_values = res;
+                            control.live.write().unwrap().vbap_polar_azimuth_values = res;
                             Some("/gsrd/state/vbap/polar/azimuth_resolution")
                         }
                         "elevation_resolution" => {
-                            control
-                                .live
-                                .write()
-                                .unwrap()
-                                .vbap_polar_elevation_values = res;
+                            control.live.write().unwrap().vbap_polar_elevation_values = res;
                             Some("/gsrd/state/vbap/polar/elevation_resolution")
                         }
                         _ => None,
@@ -1071,7 +1073,12 @@ fn handle_control_message(
                 if let Some(max_v) = max_v {
                     control.live.write().unwrap().vbap_polar_distance_max = max_v;
                     set_dirty(control, socket, clients);
-                    broadcast_float(socket, clients, "/gsrd/state/vbap/polar/distance_max", max_v);
+                    broadcast_float(
+                        socket,
+                        clients,
+                        "/gsrd/state/vbap/polar/distance_max",
+                        max_v,
+                    );
                     trigger_layout_recompute(control, socket, clients);
                 }
             }
@@ -1546,52 +1553,52 @@ fn trigger_layout_recompute(
 
     #[cfg(feature = "sparta")]
     {
-    // 1. Recompute is only possible with the sparta path.
-    if control.vbap_rebuild_params.is_none() {
-        log::warn!(
-            "OSC apply: VBAP speaker positions cannot be updated — pre-loaded table does not support recompute"
-        );
-        broadcast_int(socket, clients, "/gsrd/state/speakers/recomputing", 0);
-        return;
-    }
-
-    // 2. Reject if a recompute is already in progress.
-    if control
-        .recomputing
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        log::warn!("OSC apply: VBAP recompute already in progress, ignoring");
-        broadcast_int(socket, clients, "/gsrd/state/speakers/recomputing", 1);
-        return;
-    }
-
-    // 3. Snapshot a complete rebuild plan from the editable state.
-    let rebuild_plan = match control.prepare_topology_rebuild() {
-        Some(plan) => plan,
-        None => {
-            log::warn!("OSC apply: failed to prepare VBAP recompute plan");
+        // 1. Recompute is only possible with the sparta path.
+        if control.vbap_rebuild_params.is_none() {
+            log::warn!(
+                "OSC apply: VBAP speaker positions cannot be updated — pre-loaded table does not support recompute"
+            );
             broadcast_int(socket, clients, "/gsrd/state/speakers/recomputing", 0);
             return;
         }
-    };
 
-    // 4. Mark recomputing.
-    control
-        .recomputing
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+        // 2. Reject if a recompute is already in progress.
+        if control
+            .recomputing
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            log::warn!("OSC apply: VBAP recompute already in progress, ignoring");
+            broadcast_int(socket, clients, "/gsrd/state/speakers/recomputing", 1);
+            return;
+        }
 
-    // 5. Broadcast recomputing=1.
-    broadcast_int(socket, clients, "/gsrd/state/speakers/recomputing", 1);
+        // 3. Snapshot a complete rebuild plan from the editable state.
+        let rebuild_plan = match control.prepare_topology_rebuild() {
+            Some(plan) => plan,
+            None => {
+                log::warn!("OSC apply: failed to prepare VBAP recompute plan");
+                broadcast_int(socket, clients, "/gsrd/state/speakers/recomputing", 0);
+                return;
+            }
+        };
 
-    // 6. Spawn background recompute thread (sparta only).
-    let control_clone = Arc::clone(control);
-    let socket_clone = Arc::clone(socket);
-    let clients_clone = Arc::clone(clients);
-    let rebuild_plan_for_thread = rebuild_plan.clone();
+        // 4. Mark recomputing.
+        control
+            .recomputing
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
-    #[cfg(feature = "sparta")]
-    {
-        std::thread::Builder::new()
+        // 5. Broadcast recomputing=1.
+        broadcast_int(socket, clients, "/gsrd/state/speakers/recomputing", 1);
+
+        // 6. Spawn background recompute thread (sparta only).
+        let control_clone = Arc::clone(control);
+        let socket_clone = Arc::clone(socket);
+        let clients_clone = Arc::clone(clients);
+        let rebuild_plan_for_thread = rebuild_plan.clone();
+
+        #[cfg(feature = "sparta")]
+        {
+            std::thread::Builder::new()
             .name("vbap-recompute".into())
             .spawn(move || {
                 log::info!(
@@ -1666,7 +1673,7 @@ fn trigger_layout_recompute(
                 }
             })
             .expect("failed to spawn vbap-recompute thread");
-    }
+        }
     }
 }
 
@@ -1829,7 +1836,7 @@ fn build_live_state_bundle(control: &Arc<RendererControl>) -> Vec<u8> {
         OscPacket::Message(OscMessage {
             addr: "/gsrd/state/adaptive_resampling/ki".to_string(),
             args: vec![OscType::Float(
-                control.requested_adaptive_resampling_ki() as f32,
+                control.requested_adaptive_resampling_ki() as f32
             )],
         }),
         OscPacket::Message(OscMessage {
@@ -2204,8 +2211,7 @@ fn save_live_config(
     render.pw_latency = control.requested_latency_target_ms();
     render.adaptive_resampling_kp_near =
         Some(control.requested_adaptive_resampling_kp_near() as f32);
-    render.adaptive_resampling_kp_far =
-        Some(control.requested_adaptive_resampling_kp_far() as f32);
+    render.adaptive_resampling_kp_far = Some(control.requested_adaptive_resampling_kp_far() as f32);
     render.adaptive_resampling_ki = Some(control.requested_adaptive_resampling_ki() as f32);
     render.adaptive_resampling_max_adjust =
         Some(control.requested_adaptive_resampling_max_adjust() as f32);

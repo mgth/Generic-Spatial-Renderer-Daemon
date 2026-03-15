@@ -56,10 +56,7 @@ where
             break;
         }
 
-        let consumes_next = matches!(
-            arg_str.as_ref(),
-            "--config" | "--loglevel" | "--log-format"
-        );
+        let consumes_next = matches!(arg_str.as_ref(), "--config" | "--loglevel" | "--log-format");
         insert_at += 1;
         if consumes_next && insert_at < args.len() {
             insert_at += 1;

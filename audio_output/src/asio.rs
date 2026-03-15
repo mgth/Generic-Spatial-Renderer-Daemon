@@ -8,10 +8,15 @@ use rubato::{
 };
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
 };
 use std::thread;
 use std::time::Duration;
+
+use crate::{
+    ADAPTIVE_BAND_HARD, AdaptiveControllerState, AdaptiveResamplingConfig, adaptive_band_name,
+    apply_ema, compute_adaptive_step,
+};
 
 // Buffer size: 4 seconds of audio at 48kHz, 16 channels
 const BUFFER_SIZE: usize = 48000 * 16 * 4;
@@ -20,11 +25,7 @@ const BUFFER_SIZE: usize = 48000 * 16 * 4;
 const MIN_BUFFER_MS: u32 = 25;
 const TARGET_BUFFER_MS: u32 = 220;
 const MAX_BUFFER_MS: u32 = 250;
-const RATE_ADJUST_P_GAIN: f64 = 0.0001;
-const RATE_ADJUST_I_GAIN: f64 = 0.000001;
-// Maximum rate adjustment: ±2% for real-time streaming (clock differences between source/sink)
-const MAX_RATE_ADJUST: f64 = 0.02;
-const MAX_INTEGRAL_TERM: f64 = MAX_RATE_ADJUST / 2.0;
+const MAX_INTEGRAL_TERM: f64 = 0.0002;
 
 // Rubato constants
 const RESAMPLER_CHUNK_SIZE: usize = 1024; // Input chunk size for resampler
@@ -37,6 +38,12 @@ pub struct AsioWriter {
     stream_ready: Arc<AtomicBool>,
     enable_adaptive_resampling: bool, // Enable PI controller for buffer stability
     max_buffer_fill: usize,
+    target_buffer_fill: usize,
+    current_rate_adjust: Arc<AtomicU32>,
+    current_adaptive_band: Arc<AtomicU8>,
+    measured_latency_ms_bits: Arc<AtomicU32>,
+    control_latency_ms_bits: Arc<AtomicU32>,
+    flush_requested: Arc<AtomicBool>,
     // We keep the stream alive by holding it here, though cpal streams run in background threads
     _stream: Option<cpal::Stream>,
 }
@@ -72,6 +79,7 @@ impl AsioWriter {
         channel_count: u32,
         sink_target: Option<String>,
         enable_adaptive_resampling: bool,
+        adaptive_config: AdaptiveResamplingConfig,
     ) -> Result<Self> {
         Self::new_with_channel_names(
             input_sample_rate,
@@ -80,6 +88,7 @@ impl AsioWriter {
             sink_target,
             None,
             enable_adaptive_resampling,
+            adaptive_config,
         )
     }
 
@@ -90,6 +99,7 @@ impl AsioWriter {
         sink_target: Option<String>,
         _channel_names: Option<Vec<String>>,
         enable_adaptive_resampling: bool,
+        adaptive_config: AdaptiveResamplingConfig,
     ) -> Result<Self> {
         // Local resampling ratio is output_rate / input_rate.
         let resample_ratio = output_sample_rate as f64 / input_sample_rate as f64;
@@ -98,6 +108,16 @@ impl AsioWriter {
         let buffer_clone = sample_buffer.clone();
         let stream_ready = Arc::new(AtomicBool::new(false));
         let ready_clone = stream_ready.clone();
+        let current_rate_adjust = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let current_rate_adjust_clone = current_rate_adjust.clone();
+        let current_adaptive_band = Arc::new(AtomicU8::new(0));
+        let current_adaptive_band_clone = current_adaptive_band.clone();
+        let measured_latency_ms_bits = Arc::new(AtomicU32::new(0u32));
+        let measured_latency_ms_bits_clone = measured_latency_ms_bits.clone();
+        let control_latency_ms_bits = Arc::new(AtomicU32::new(0u32));
+        let control_latency_ms_bits_clone = control_latency_ms_bits.clone();
+        let flush_requested = Arc::new(AtomicBool::new(false));
+        let flush_requested_clone = flush_requested.clone();
 
         // Ring-buffer thresholds in INPUT-domain samples (same domain as buffer_clone.len()).
         let samples_per_ms =
@@ -246,7 +266,12 @@ impl AsioWriter {
 
         // Calculate max ratio for adaptive adjustments
         // Allow small adjustments around the base resample ratio
-        let max_resample_ratio = resample_ratio * (1.0 + MAX_RATE_ADJUST);
+        let max_resample_ratio = resample_ratio
+            * (1.0
+                + adaptive_config
+                    .max_adjust
+                    .max(adaptive_config.max_adjust_far)
+                    .max(0.000001));
 
         log::debug!(
             "Initializing resampler: base_ratio={:.4}, max_ratio={:.4}, chunk_size={}",
@@ -277,10 +302,19 @@ impl AsioWriter {
             Vec::with_capacity(RESAMPLER_CHUNK_SIZE * channel_count as usize * 4);
 
         // Control loop state
-        let mut accumulated_drift = 0.0f64;
+        let mut controller_state = AdaptiveControllerState::default();
         let mut callback_count = 0u64;
         let mut playback_started = false;
         let mut underrun_warned = false;
+        let near_far_threshold_samples =
+            (adaptive_config.near_far_threshold_ms as usize).saturating_mul(samples_per_ms);
+        let measurement_smoothing_alpha =
+            adaptive_config.measurement_smoothing_alpha.clamp(0.0, 1.0);
+        let hard_correction_threshold_samples =
+            (adaptive_config.hard_correction_threshold_ms as usize).saturating_mul(samples_per_ms);
+        let hard_correction_release_margin = hard_correction_threshold_samples / 2;
+        let hard_correction_max_step = hard_correction_threshold_samples / 2;
+        let mut hard_correction_mode: i8 = 0;
 
         let device_channel_count_for_callback = device_channel_count;
         let adaptive_resampling_enabled = enable_adaptive_resampling;
@@ -292,53 +326,160 @@ impl AsioWriter {
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 callback_count += 1;
 
+                if flush_requested_clone.swap(false, Ordering::Relaxed) {
+                    while buffer_clone.pop().is_some() {}
+                    output_fifo.clear();
+                    input_frames_collected = 0;
+                    controller_state = AdaptiveControllerState::default();
+                    current_rate_adjust_clone.store(1.0f32.to_bits(), Ordering::Relaxed);
+                    current_adaptive_band_clone.store(0, Ordering::Relaxed);
+                    measured_latency_ms_bits_clone.store(0u32, Ordering::Relaxed);
+                    control_latency_ms_bits_clone.store(0u32, Ordering::Relaxed);
+                    playback_started = false;
+                    underrun_warned = false;
+                }
+
                 // 1. Check buffer fill & Calculate Rate
                 let available_samples = buffer_clone.len(); // Total i32 samples (frames * channels)
+                let callback_samples = data.len();
+                let control_available = available_samples.saturating_sub(callback_samples / 2);
+                let smoothed_control_available = apply_ema(
+                    &mut controller_state.smoothed_control_available,
+                    control_available as f64,
+                    measurement_smoothing_alpha,
+                )
+                .max(0.0)
+                .round() as usize;
+                let smoothed_total_available = apply_ema(
+                    &mut controller_state.smoothed_total_available,
+                    available_samples as f64,
+                    measurement_smoothing_alpha,
+                )
+                .max(0.0)
+                .round() as usize;
+                let measured_latency_ms = (smoothed_total_available as f32
+                    / channel_count as f32
+                    / input_sample_rate as f32)
+                    * 1000.0;
+                let control_latency_ms = (smoothed_control_available as f32
+                    / channel_count as f32
+                    / input_sample_rate as f32)
+                    * 1000.0;
+                measured_latency_ms_bits_clone
+                    .store(measured_latency_ms.to_bits(), Ordering::Relaxed);
+                control_latency_ms_bits_clone
+                    .store(control_latency_ms.to_bits(), Ordering::Relaxed);
+
+                let mut hard_zero_fill = false;
+                if adaptive_resampling_enabled && hard_correction_threshold_samples > 0 {
+                    if hard_correction_mode < 0 {
+                        if smoothed_control_available.saturating_add(hard_correction_release_margin)
+                            >= target_buffer_fill
+                        {
+                            hard_correction_mode = 0;
+                        } else {
+                            controller_state.accumulated_drift = 0.0;
+                            current_rate_adjust_clone.store(1.0f32.to_bits(), Ordering::Relaxed);
+                            current_adaptive_band_clone.store(ADAPTIVE_BAND_HARD, Ordering::Relaxed);
+                            hard_zero_fill = true;
+                        }
+                    } else if hard_correction_mode > 0 {
+                        let desired_keep =
+                            target_buffer_fill.saturating_add(hard_correction_release_margin);
+                        if smoothed_total_available <= desired_keep {
+                            hard_correction_mode = 0;
+                        } else {
+                            let mut to_drop = smoothed_total_available.saturating_sub(desired_keep);
+                            to_drop = to_drop.min(hard_correction_max_step.max(channel_count as usize));
+                            let fifo_drop = to_drop.min(output_fifo.len());
+                            if fifo_drop > 0 {
+                                output_fifo.drain(0..fifo_drop);
+                                to_drop = to_drop.saturating_sub(fifo_drop);
+                            }
+                            let ring_drop = (to_drop / channel_count as usize) * channel_count as usize;
+                            for _ in 0..ring_drop {
+                                let _ = buffer_clone.pop();
+                            }
+                            controller_state.accumulated_drift = 0.0;
+                            current_adaptive_band_clone.store(ADAPTIVE_BAND_HARD, Ordering::Relaxed);
+                        }
+                    } else if smoothed_control_available
+                        .saturating_add(hard_correction_threshold_samples)
+                        < target_buffer_fill
+                    {
+                        hard_correction_mode = -1;
+                        controller_state.accumulated_drift = 0.0;
+                        current_rate_adjust_clone.store(1.0f32.to_bits(), Ordering::Relaxed);
+                        current_adaptive_band_clone.store(ADAPTIVE_BAND_HARD, Ordering::Relaxed);
+                        hard_zero_fill = true;
+                    } else if smoothed_total_available
+                        > target_buffer_fill.saturating_add(hard_correction_threshold_samples)
+                    {
+                        hard_correction_mode = 1;
+                        let mut to_drop = smoothed_total_available.saturating_sub(
+                            target_buffer_fill.saturating_add(hard_correction_release_margin),
+                        );
+                        to_drop = to_drop.min(hard_correction_max_step.max(channel_count as usize));
+                        let fifo_drop = to_drop.min(output_fifo.len());
+                        if fifo_drop > 0 {
+                            output_fifo.drain(0..fifo_drop);
+                            to_drop = to_drop.saturating_sub(fifo_drop);
+                        }
+                        let ring_drop = (to_drop / channel_count as usize) * channel_count as usize;
+                        for _ in 0..ring_drop {
+                            let _ = buffer_clone.pop();
+                        }
+                        controller_state.accumulated_drift = 0.0;
+                        current_adaptive_band_clone.store(ADAPTIVE_BAND_HARD, Ordering::Relaxed);
+                    }
+                }
+
+                if hard_zero_fill {
+                    data.fill(0.0);
+                    return;
+                }
 
                 // Adaptive rate logic (PI Controller)
                 // Adjusts the resampling ratio around the base ratio to maintain buffer level
                 // Only active if adaptive resampling is enabled
                 if adaptive_resampling_enabled {
-                    let drift = available_samples as i64 - target_buffer_fill as i64;
-
                     // Only adjust rate if we have started playback and have enough data
                     if playback_started && callback_count % 10 == 0 {
-                         if drift.abs() > 100 { // Deadband
-                            accumulated_drift += drift as f64;
-                            // Anti-windup
-                            let integral_contribution = accumulated_drift * RATE_ADJUST_I_GAIN;
-                            if integral_contribution.abs() > MAX_INTEGRAL_TERM {
-                                accumulated_drift = (MAX_INTEGRAL_TERM / RATE_ADJUST_I_GAIN) * integral_contribution.signum();
-                            }
-                        }
-
-                        let p_term = drift as f64 * RATE_ADJUST_P_GAIN / 100.0;
-                        let i_term = accumulated_drift * RATE_ADJUST_I_GAIN;
-
-                        // >1.0 means "consume input faster".
-                        let consume_adjust = (1.0 + p_term + i_term).clamp(
-                            1.0 - MAX_RATE_ADJUST,
-                            1.0 + MAX_RATE_ADJUST,
-                        );
-                        // SincFixedIn ratio is OUTPUT/INPUT.
-                        // For a fixed output demand, faster INPUT consumption means smaller ratio.
-                        let current_ratio = (resample_ratio / consume_adjust).clamp(
-                            resample_ratio * (1.0 - MAX_RATE_ADJUST),
-                            resample_ratio * (1.0 + MAX_RATE_ADJUST)
+                        let step = compute_adaptive_step(
+                            &mut controller_state,
+                            &adaptive_config,
+                            smoothed_control_available,
+                            target_buffer_fill,
+                            near_far_threshold_samples,
+                            resample_ratio,
+                            100,
+                            MAX_INTEGRAL_TERM,
                         );
 
                         // Update resampler ratio
-                        if let Err(e) = resampler.set_resample_ratio(current_ratio, true) {
+                        if let Err(e) = resampler.set_resample_ratio(step.current_ratio, true) {
                             log::warn!("Failed to set resampler ratio: {}", e);
                         }
+                        current_rate_adjust_clone
+                            .store((step.consume_adjust as f32).to_bits(), Ordering::Relaxed);
+                        current_adaptive_band_clone.store(step.band, Ordering::Relaxed);
 
                         if callback_count % 100 == 0 {
-                             log::debug!(
+                            log::debug!(
                                 "ASIO Adaptive: buf={}/{} drift={} ratio={:.6} (base={:.2} P={:.6} I={:.6})",
-                                available_samples, max_buffer_fill, drift, current_ratio, resample_ratio, p_term, i_term
+                                smoothed_control_available,
+                                target_buffer_fill,
+                                step.drift,
+                                step.current_ratio,
+                                resample_ratio,
+                                step.p_term,
+                                step.i_term
                             );
                         }
                     }
+                } else {
+                    current_rate_adjust_clone.store(1.0f32.to_bits(), Ordering::Relaxed);
+                    current_adaptive_band_clone.store(0, Ordering::Relaxed);
                 }
 
                 // 2. Feed Resampler until we have enough data in output_fifo for this callback
@@ -354,7 +495,7 @@ impl AsioWriter {
                     while input_frames_collected < RESAMPLER_CHUNK_SIZE {
                         // Try to pop one frame (all channels)
                         let mut frame_complete = true;
-                        
+
                         // Check if we have a full frame available in ringbuffer
                         if buffer_clone.len() >= channel_count as usize {
                             for ch in 0..channel_count as usize {
@@ -374,9 +515,9 @@ impl AsioWriter {
                             input_frames_collected += 1;
                         } else {
                             // Not enough data in input buffer to fill a resampler chunk
-                            // If playback hasn't started, wait. 
+                            // If playback hasn't started, wait.
                             // If it has, this is an underrun condition.
-                            break; 
+                            break;
                         }
                     }
 
@@ -476,6 +617,12 @@ impl AsioWriter {
             stream_ready,
             enable_adaptive_resampling,
             max_buffer_fill,
+            target_buffer_fill,
+            current_rate_adjust,
+            current_adaptive_band,
+            measured_latency_ms_bits,
+            control_latency_ms_bits,
+            flush_requested,
             _stream: Some(stream),
         })
     }
@@ -524,5 +671,40 @@ impl AsioWriter {
             thread::sleep(Duration::from_millis(50));
         }
         Ok(())
+    }
+
+    pub fn latency_ms(&self) -> f32 {
+        self.measured_audio_delay_ms()
+    }
+
+    pub fn rate_adjust(&self) -> Option<f32> {
+        if self.enable_adaptive_resampling {
+            Some(f32::from_bits(
+                self.current_rate_adjust.load(Ordering::Relaxed),
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub fn adaptive_band(&self) -> Option<&'static str> {
+        adaptive_band_name(self.current_adaptive_band.load(Ordering::Relaxed))
+    }
+
+    pub fn total_audio_delay_ms(&self) -> f32 {
+        (self.target_buffer_fill as f32 / self.channel_count as f32 / self.sample_rate as f32)
+            * 1000.0
+    }
+
+    pub fn measured_audio_delay_ms(&self) -> f32 {
+        f32::from_bits(self.measured_latency_ms_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn control_audio_delay_ms(&self) -> f32 {
+        f32::from_bits(self.control_latency_ms_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn request_flush(&self) {
+        self.flush_requested.store(true, Ordering::Relaxed);
     }
 }

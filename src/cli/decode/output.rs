@@ -1,4 +1,6 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
+#[cfg(all(target_os = "windows", feature = "asio"))]
+use audio_output::AdaptiveResamplingConfig;
 #[cfg(all(target_os = "windows", feature = "asio"))]
 use audio_output::asio::AsioWriter;
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
@@ -102,6 +104,7 @@ impl AudioWriter {
         channel_count: u32,
         device_name: Option<String>,
         enable_adaptive_resampling: bool,
+        adaptive_config: AdaptiveResamplingConfig,
     ) -> Result<Self> {
         let asio_writer = AsioWriter::new(
             input_sample_rate,
@@ -109,6 +112,7 @@ impl AudioWriter {
             channel_count,
             device_name,
             enable_adaptive_resampling,
+            adaptive_config,
         )?;
         Ok(AudioWriter::Asio(asio_writer))
     }
@@ -189,7 +193,7 @@ impl AudioWriter {
             #[cfg(all(target_os = "linux", feature = "pipewire"))]
             AudioWriter::Pipewire(pw) => Some(pw.latency_ms()),
             #[cfg(all(target_os = "windows", feature = "asio"))]
-            AudioWriter::Asio(_) => None,
+            AudioWriter::Asio(asio) => Some(asio.latency_ms()),
             AudioWriter::Unsupported => None,
         }
     }
@@ -201,7 +205,7 @@ impl AudioWriter {
             #[cfg(all(target_os = "linux", feature = "pipewire"))]
             AudioWriter::Pipewire(pw) => pw.rate_adjust(),
             #[cfg(all(target_os = "windows", feature = "asio"))]
-            AudioWriter::Asio(_) => None,
+            AudioWriter::Asio(asio) => asio.rate_adjust(),
             AudioWriter::Unsupported => None,
         }
     }
@@ -211,7 +215,7 @@ impl AudioWriter {
             #[cfg(all(target_os = "linux", feature = "pipewire"))]
             AudioWriter::Pipewire(pw) => pw.adaptive_band(),
             #[cfg(all(target_os = "windows", feature = "asio"))]
-            AudioWriter::Asio(_) => None,
+            AudioWriter::Asio(asio) => asio.adaptive_band(),
             AudioWriter::Unsupported => None,
         }
     }
@@ -225,7 +229,10 @@ impl AudioWriter {
                 if v > 0.0 { Some(v) } else { None }
             }
             #[cfg(all(target_os = "windows", feature = "asio"))]
-            AudioWriter::Asio(_) => None,
+            AudioWriter::Asio(asio) => {
+                let v = asio.total_audio_delay_ms();
+                if v > 0.0 { Some(v) } else { None }
+            }
             AudioWriter::Unsupported => None,
         }
     }
@@ -239,7 +246,10 @@ impl AudioWriter {
                 if v > 0.0 { Some(v) } else { None }
             }
             #[cfg(all(target_os = "windows", feature = "asio"))]
-            AudioWriter::Asio(_) => None,
+            AudioWriter::Asio(asio) => {
+                let v = asio.measured_audio_delay_ms();
+                if v > 0.0 { Some(v) } else { None }
+            }
             AudioWriter::Unsupported => None,
         }
     }
@@ -252,7 +262,10 @@ impl AudioWriter {
                 if v > 0.0 { Some(v) } else { None }
             }
             #[cfg(all(target_os = "windows", feature = "asio"))]
-            AudioWriter::Asio(_) => None,
+            AudioWriter::Asio(asio) => {
+                let v = asio.control_audio_delay_ms();
+                if v > 0.0 { Some(v) } else { None }
+            }
             AudioWriter::Unsupported => None,
         }
     }
@@ -263,7 +276,7 @@ impl AudioWriter {
             #[cfg(all(target_os = "linux", feature = "pipewire"))]
             AudioWriter::Pipewire(pw) => pw.request_flush(),
             #[cfg(all(target_os = "windows", feature = "asio"))]
-            AudioWriter::Asio(_) => {}
+            AudioWriter::Asio(asio) => asio.request_flush(),
             AudioWriter::Unsupported => {}
         }
     }

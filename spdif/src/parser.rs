@@ -13,10 +13,7 @@ pub struct Iec61937Packet {
 enum ParserState {
     WaitingForSync,
     WaitingForHeader,
-    WaitingForPayload {
-        data_type: u8,
-        payload_size: usize,
-    },
+    WaitingForPayload { data_type: u8, payload_size: usize },
 }
 
 /// IEC 61937 S/PDIF parser that extracts transport packets.

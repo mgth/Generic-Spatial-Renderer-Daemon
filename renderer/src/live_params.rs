@@ -418,18 +418,14 @@ impl RendererControl {
             requested_output_sample_rate_hz: std::sync::atomic::AtomicU32::new(0),
             requested_adaptive_resampling: std::sync::atomic::AtomicBool::new(false),
             requested_latency_target_ms: std::sync::atomic::AtomicU32::new(0),
-            requested_adaptive_resampling_kp_near_bits:
-                std::sync::atomic::AtomicU32::new(0),
-            requested_adaptive_resampling_kp_far_bits:
-                std::sync::atomic::AtomicU32::new(0),
-            requested_adaptive_resampling_ki_bits:
-                std::sync::atomic::AtomicU32::new(0),
-            requested_adaptive_resampling_max_adjust_bits:
-                std::sync::atomic::AtomicU32::new(0),
-            requested_adaptive_resampling_max_adjust_far_bits:
-                std::sync::atomic::AtomicU32::new(0),
-            requested_adaptive_resampling_near_far_threshold_ms:
-                std::sync::atomic::AtomicU32::new(0),
+            requested_adaptive_resampling_kp_near_bits: std::sync::atomic::AtomicU32::new(0),
+            requested_adaptive_resampling_kp_far_bits: std::sync::atomic::AtomicU32::new(0),
+            requested_adaptive_resampling_ki_bits: std::sync::atomic::AtomicU32::new(0),
+            requested_adaptive_resampling_max_adjust_bits: std::sync::atomic::AtomicU32::new(0),
+            requested_adaptive_resampling_max_adjust_far_bits: std::sync::atomic::AtomicU32::new(0),
+            requested_adaptive_resampling_near_far_threshold_ms: std::sync::atomic::AtomicU32::new(
+                0,
+            ),
             requested_adaptive_resampling_hard_correction_threshold_ms:
                 std::sync::atomic::AtomicU32::new(0),
             requested_adaptive_resampling_measurement_smoothing_alpha_bits:
@@ -456,10 +452,7 @@ impl RendererControl {
         self.editable_layout.lock().unwrap().clone()
     }
 
-    pub fn with_editable_layout<R>(
-        &self,
-        f: impl FnOnce(&mut SpeakerLayout) -> R,
-    ) -> R {
+    pub fn with_editable_layout<R>(&self, f: impl FnOnce(&mut SpeakerLayout) -> R) -> R {
         let mut layout = self.editable_layout.lock().unwrap();
         f(&mut layout)
     }
@@ -497,25 +490,23 @@ impl RendererControl {
                 },
             },
             LiveVbapTableMode::Polar => crate::spatial_vbap::VbapTableMode::Polar,
-            LiveVbapTableMode::Cartesian => {
-                crate::spatial_vbap::VbapTableMode::Cartesian {
-                    x_size: live
-                        .vbap_cart_x_size
-                        .max(rebuild.cartesian_default_x_size)
-                        .max(1)
-                        + 1,
-                    y_size: live
-                        .vbap_cart_y_size
-                        .max(rebuild.cartesian_default_y_size)
-                        .max(1)
-                        + 1,
-                    z_size: live
-                        .vbap_cart_z_size
-                        .max(rebuild.cartesian_default_z_size)
-                        .max(1)
-                        + 1,
-                }
-            }
+            LiveVbapTableMode::Cartesian => crate::spatial_vbap::VbapTableMode::Cartesian {
+                x_size: live
+                    .vbap_cart_x_size
+                    .max(rebuild.cartesian_default_x_size)
+                    .max(1)
+                    + 1,
+                y_size: live
+                    .vbap_cart_y_size
+                    .max(rebuild.cartesian_default_y_size)
+                    .max(1)
+                    + 1,
+                z_size: live
+                    .vbap_cart_z_size
+                    .max(rebuild.cartesian_default_z_size)
+                    .max(1)
+                    + 1,
+            },
         };
         let azimuth_resolution = if live.vbap_polar_azimuth_values > 0 {
             ((360.0f32 / (live.vbap_polar_azimuth_values as f32)).round() as i32).clamp(1, 360)
@@ -523,8 +514,11 @@ impl RendererControl {
             rebuild.az_res_deg.clamp(1, 360)
         };
         let elevation_resolution = if live.vbap_polar_elevation_values > 0 {
-            (((if rebuild.allow_negative_z { 180.0 } else { 90.0 })
-                / (live.vbap_polar_elevation_values as f32))
+            (((if rebuild.allow_negative_z {
+                180.0
+            } else {
+                90.0
+            }) / (live.vbap_polar_elevation_values as f32))
                 .round() as i32)
                 .clamp(1, if rebuild.allow_negative_z { 180 } else { 90 })
         } else {
