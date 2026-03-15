@@ -2,7 +2,9 @@ use anyhow::{anyhow, Result};
 #[cfg(all(target_os = "windows", feature = "asio"))]
 use audio_output::asio::AsioWriter;
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
-use audio_output::pipewire::{PipewireBufferConfig, PipewireWriter};
+use audio_output::pipewire::{
+    PipewireAdaptiveResamplingConfig, PipewireBufferConfig, PipewireWriter,
+};
 
 /// Audio sample data in different formats
 pub enum AudioSamples {
@@ -55,6 +57,7 @@ impl AudioWriter {
         enable_adaptive_resampling: bool,
         output_sample_rate: Option<u32>,
         buffer_config: PipewireBufferConfig,
+        adaptive_config: PipewireAdaptiveResamplingConfig,
     ) -> Result<Self> {
         let pipewire_writer = PipewireWriter::new(
             sample_rate,
@@ -63,6 +66,7 @@ impl AudioWriter {
             enable_adaptive_resampling,
             output_sample_rate,
             buffer_config,
+            adaptive_config,
         )?;
         Ok(AudioWriter::Pipewire(pipewire_writer))
     }
@@ -76,6 +80,7 @@ impl AudioWriter {
         enable_adaptive_resampling: bool,
         output_sample_rate: Option<u32>,
         buffer_config: PipewireBufferConfig,
+        adaptive_config: PipewireAdaptiveResamplingConfig,
     ) -> Result<Self> {
         let pipewire_writer = PipewireWriter::new_with_channel_names(
             sample_rate,
@@ -85,6 +90,7 @@ impl AudioWriter {
             enable_adaptive_resampling,
             output_sample_rate,
             buffer_config,
+            adaptive_config,
         )?;
         Ok(AudioWriter::Pipewire(pipewire_writer))
     }
@@ -200,6 +206,16 @@ impl AudioWriter {
         }
     }
 
+    pub fn adaptive_band(&self) -> Option<&'static str> {
+        match self {
+            #[cfg(all(target_os = "linux", feature = "pipewire"))]
+            AudioWriter::Pipewire(pw) => pw.adaptive_band(),
+            #[cfg(all(target_os = "windows", feature = "asio"))]
+            AudioWriter::Asio(_) => None,
+            AudioWriter::Unsupported => None,
+        }
+    }
+
     /// Total audio delay in ms (ring-buffer target + backend graph latency).
     pub fn total_audio_delay_ms(&self) -> Option<f32> {
         match self {
@@ -220,6 +236,19 @@ impl AudioWriter {
             #[cfg(all(target_os = "linux", feature = "pipewire"))]
             AudioWriter::Pipewire(pw) => {
                 let v = pw.measured_audio_delay_ms();
+                if v > 0.0 { Some(v) } else { None }
+            }
+            #[cfg(all(target_os = "windows", feature = "asio"))]
+            AudioWriter::Asio(_) => None,
+            AudioWriter::Unsupported => None,
+        }
+    }
+
+    pub fn control_audio_delay_ms(&self) -> Option<f32> {
+        match self {
+            #[cfg(all(target_os = "linux", feature = "pipewire"))]
+            AudioWriter::Pipewire(pw) => {
+                let v = pw.control_audio_delay_ms();
                 if v > 0.0 { Some(v) } else { None }
             }
             #[cfg(all(target_os = "windows", feature = "asio"))]

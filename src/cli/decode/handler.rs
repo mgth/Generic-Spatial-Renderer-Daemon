@@ -1,8 +1,8 @@
 use super::output::{AudioSamples, AudioWriter};
-#[cfg(all(target_os = "linux", feature = "pipewire"))]
-use audio_output::pipewire::PipewireBufferConfig;
 use crate::cli::command::OutputBackend;
 use crate::events::{Configuration, Event};
+#[cfg(all(target_os = "linux", feature = "pipewire"))]
+use audio_output::pipewire::{PipewireAdaptiveResamplingConfig, PipewireBufferConfig};
 use bridge_api::{RChannelLabel, RCoordinateFormat, RDecodedFrame, RMetadataFrame};
 
 use anyhow::{anyhow, Result};
@@ -12,6 +12,7 @@ use renderer::osc_output::{ObjectMeta, OscSender};
 use renderer::speaker_layout::SpeakerLayout;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Instant;
 
 struct BedChannelMapper;
 
@@ -472,6 +473,8 @@ pub struct RuntimeOutputState {
     pub sink_target: Option<String>,
     #[cfg(all(target_os = "linux", feature = "pipewire"))]
     pub pw_buffer_config: PipewireBufferConfig,
+    #[cfg(all(target_os = "linux", feature = "pipewire"))]
+    pub pw_adaptive_config: PipewireAdaptiveResamplingConfig,
     #[cfg(all(target_os = "windows", feature = "asio"))]
     pub asio_device_name: Option<String>,
     /// Works for both ASIO (Windows) and PipeWire (Linux)
@@ -486,6 +489,8 @@ impl Default for RuntimeOutputState {
             sink_target: None,
             #[cfg(all(target_os = "linux", feature = "pipewire"))]
             pw_buffer_config: PipewireBufferConfig::default(),
+            #[cfg(all(target_os = "linux", feature = "pipewire"))]
+            pw_adaptive_config: PipewireAdaptiveResamplingConfig::default(),
             #[cfg(all(target_os = "windows", feature = "asio"))]
             asio_device_name: None,
             output_sample_rate: None,
@@ -545,6 +550,10 @@ impl Default for SpatialState {
 
 pub struct OutputState {
     pub audio_writer: Option<AudioWriter>,
+    /// Number of decoded frames seen since the current writer bootstrap started.
+    pub bootstrap_frames_seen: u32,
+    /// Timestamp of the current writer bootstrap attempt.
+    pub bootstrap_started_at: Option<Instant>,
     /// Reusable output buffer donated to render_frame and returned via RenderedFrame::samples.
     /// Eliminates per-frame heap allocation after the first rendered frame.
     pub render_buf: Vec<f32>,
@@ -562,6 +571,8 @@ impl Default for OutputState {
     fn default() -> Self {
         Self {
             audio_writer: None,
+            bootstrap_frames_seen: 0,
+            bootstrap_started_at: None,
             render_buf: Vec::new(),
             pcm_f32_buf: Vec::new(),
             last_audio_delay_written_ms: None,
@@ -711,10 +722,7 @@ impl DecodeHandler {
         Ok(())
     }
 
-    fn sync_requested_adaptive_resampling(
-        &mut self,
-        output_backend: OutputBackend,
-    ) -> Result<()> {
+    fn sync_requested_adaptive_resampling(&mut self, output_backend: OutputBackend) -> Result<()> {
         let requested = self
             .spatial_renderer
             .as_ref()
@@ -790,17 +798,79 @@ impl DecodeHandler {
         Ok(())
     }
 
+    fn sync_requested_adaptive_tuning(&mut self, output_backend: OutputBackend) -> Result<()> {
+        #[cfg(all(target_os = "linux", feature = "pipewire"))]
+        {
+            let requested = self
+                .spatial_renderer
+                .as_ref()
+                .map(|r| r.renderer_control())
+                .map(|control| PipewireAdaptiveResamplingConfig {
+                    kp_near: control.requested_adaptive_resampling_kp_near(),
+                    kp_far: control.requested_adaptive_resampling_kp_far(),
+                    ki: control.requested_adaptive_resampling_ki(),
+                    max_adjust: control.requested_adaptive_resampling_max_adjust(),
+                    max_adjust_far: control.requested_adaptive_resampling_max_adjust_far(),
+                    near_far_threshold_ms: control
+                        .requested_adaptive_resampling_near_far_threshold_ms(),
+                    hard_correction_threshold_ms: control
+                        .requested_adaptive_resampling_hard_correction_threshold_ms(),
+                    measurement_smoothing_alpha: control
+                        .requested_adaptive_resampling_measurement_smoothing_alpha(),
+                })
+                .unwrap_or_else(|| self.runtime.pw_adaptive_config.clone());
+
+            if requested.kp_near == self.runtime.pw_adaptive_config.kp_near
+                && requested.kp_far == self.runtime.pw_adaptive_config.kp_far
+                && requested.ki == self.runtime.pw_adaptive_config.ki
+                && requested.max_adjust == self.runtime.pw_adaptive_config.max_adjust
+                && requested.max_adjust_far == self.runtime.pw_adaptive_config.max_adjust_far
+                && requested.near_far_threshold_ms
+                    == self.runtime.pw_adaptive_config.near_far_threshold_ms
+                && requested.hard_correction_threshold_ms
+                    == self.runtime.pw_adaptive_config.hard_correction_threshold_ms
+                && requested.measurement_smoothing_alpha
+                    == self.runtime.pw_adaptive_config.measurement_smoothing_alpha
+            {
+                return Ok(());
+            }
+
+            self.runtime.pw_adaptive_config = requested;
+            log::info!(
+                "Applying adaptive resampling tuning: kp_near={:.8}, kp_far={:.8}, ki={:.8}, max_adjust={:.6}, max_adjust_far={:.6}, near_far_threshold_ms={}, hard_correction_threshold_ms={}, measurement_smoothing_alpha={:.3}",
+                self.runtime.pw_adaptive_config.kp_near,
+                self.runtime.pw_adaptive_config.kp_far,
+                self.runtime.pw_adaptive_config.ki,
+                self.runtime.pw_adaptive_config.max_adjust,
+                self.runtime.pw_adaptive_config.max_adjust_far,
+                self.runtime.pw_adaptive_config.near_far_threshold_ms,
+                self.runtime.pw_adaptive_config.hard_correction_threshold_ms,
+                self.runtime.pw_adaptive_config.measurement_smoothing_alpha
+            );
+
+            if let OutputBackend::Pipewire = output_backend {
+                if let Some(mut writer) = self.output.audio_writer.take() {
+                    let _ = writer.flush();
+                }
+            }
+        }
+
+        #[cfg(not(all(target_os = "linux", feature = "pipewire")))]
+        let _ = output_backend;
+
+        Ok(())
+    }
+
     fn publish_audio_state_if_changed(
         &mut self,
         output_backend: OutputBackend,
         input_sample_rate: u32,
     ) {
-        let (effective_rate, sample_format) =
-            Self::effective_audio_state(
-                output_backend,
-                input_sample_rate,
-                self.runtime.output_sample_rate,
-            );
+        let (effective_rate, sample_format) = Self::effective_audio_state(
+            output_backend,
+            input_sample_rate,
+            self.runtime.output_sample_rate,
+        );
 
         if self.output.last_audio_sample_rate_hz == Some(effective_rate)
             && self.output.last_audio_sample_format.as_deref() == Some(sample_format)
@@ -850,12 +920,7 @@ impl DecodeHandler {
             }
         }
 
-        self.handle_spatial_metadata(
-            &frame,
-            ctx.output_backend,
-            ctx.state,
-            ctx.bed_conform,
-        )?;
+        self.handle_spatial_metadata(&frame, ctx.output_backend, ctx.state, ctx.bed_conform)?;
 
         self.session.decoded_samples += sample_count as u64;
 
@@ -873,6 +938,7 @@ impl DecodeHandler {
         self.sync_requested_output_sample_rate(ctx.output_backend)?;
         self.sync_requested_adaptive_resampling(ctx.output_backend)?;
         self.sync_requested_latency_target(ctx.output_backend)?;
+        self.sync_requested_adaptive_tuning(ctx.output_backend)?;
         self.create_audio_writer_if_needed(
             ctx.output_backend,
             sample_rate,
@@ -902,27 +968,27 @@ impl DecodeHandler {
 
         for meta in frame.metadata.iter() {
             let conf = Configuration::from(meta);
-            let was_objects = self.spatial.has_objects;
             self.spatial.has_objects = true;
 
-            if !was_objects {
-                // Bed indices are provided explicitly by the bridge.
-                self.spatial.bed_indices = if meta.bed_indices.is_empty() {
-                    None
-                } else {
-                    Some(meta.bed_indices.iter().copied().collect())
-                };
+            // Bed indices are provided explicitly by the bridge and may appear
+            // only after object mode is already active. Apply them whenever a
+            // metadata frame carries a non-empty set so the renderer does not
+            // stay stuck in the temporary "all objects" fallback path.
+            if !meta.bed_indices.is_empty() {
+                let new_bed_indices: Vec<usize> = meta.bed_indices.iter().copied().collect();
+                let changed = self.spatial.bed_indices.as_ref() != Some(&new_bed_indices);
+                if changed {
+                    self.spatial.bed_indices = Some(new_bed_indices);
+                    log::debug!(
+                        "Extracted bed indices from bridge metadata: {:?}",
+                        self.spatial.bed_indices
+                    );
 
-                log::debug!(
-                    "Extracted bed indices from bridge metadata: {:?}",
-                    self.spatial.bed_indices
-                );
-
-                // Inform the renderer of the bed layout.
-                if let (Some(renderer), Some(bi)) =
-                    (&self.spatial_renderer, &self.spatial.bed_indices)
-                {
-                    renderer.configure_beds(bi);
+                    if let (Some(renderer), Some(bi)) =
+                        (&self.spatial_renderer, &self.spatial.bed_indices)
+                    {
+                        renderer.configure_beds(bi);
+                    }
                 }
             }
 
@@ -1078,10 +1144,47 @@ impl DecodeHandler {
         if self.output.audio_writer.is_none() {
             #[cfg(all(target_os = "linux", feature = "pipewire"))]
             if output_backend == OutputBackend::Pipewire {
+                // With VBAP active, do not start PipeWire on the first decoded
+                // frames before we know whether the stream carries objects.
+                // For object streams we wait until explicit bed/object metadata
+                // has arrived and stabilized a little. For non-object content we
+                // allow a short fallback bootstrap after a handful of frames.
+                if self.spatial_renderer.is_some() {
+                    self.output
+                        .bootstrap_started_at
+                        .get_or_insert_with(Instant::now);
+                    if !self.spatial.has_objects {
+                        self.output.bootstrap_frames_seen =
+                            self.output.bootstrap_frames_seen.saturating_add(1);
+                        if self.output.bootstrap_frames_seen < 8 {
+                            return Ok(());
+                        }
+                    } else {
+                        if self.spatial.bed_indices.is_none() {
+                            self.output.bootstrap_frames_seen = 0;
+                            return Ok(());
+                        }
+                        self.output.bootstrap_frames_seen =
+                            self.output.bootstrap_frames_seen.saturating_add(1);
+                        if self.output.bootstrap_frames_seen < 3 {
+                            return Ok(());
+                        }
+                    }
+                }
+
                 log::info!(
-                    "Creating PipeWire audio stream: {} Hz, {} channels",
+                    "Creating PipeWire audio stream: {} Hz, {} channels (bootstrap_frames={}, has_objects={}, bed_indices={:?}, decoded_frames={}, decoded_samples={}, bootstrap_elapsed_ms={:.0})",
                     sample_rate,
-                    channel_count
+                    channel_count,
+                    self.output.bootstrap_frames_seen,
+                    self.spatial.has_objects,
+                    self.spatial.bed_indices,
+                    self.session.decoded_frames,
+                    self.session.decoded_samples,
+                    self.output
+                        .bootstrap_started_at
+                        .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0)
                 );
 
                 // If VBAP is active, use speaker names for channel labels
@@ -1102,6 +1205,8 @@ impl DecodeHandler {
                     channel_count,
                     speaker_names,
                 )?);
+                self.output.bootstrap_frames_seen = 0;
+                self.output.bootstrap_started_at = None;
                 return Ok(());
             }
 
@@ -1167,6 +1272,7 @@ impl DecodeHandler {
                         self.runtime.enable_adaptive_resampling,
                         self.runtime.output_sample_rate,
                         self.runtime.pw_buffer_config.clone(),
+                        self.runtime.pw_adaptive_config.clone(),
                     )?)
                 } else {
                     Ok(AudioWriter::create_pipewire(
@@ -1176,6 +1282,7 @@ impl DecodeHandler {
                         self.runtime.enable_adaptive_resampling,
                         self.runtime.output_sample_rate,
                         self.runtime.pw_buffer_config.clone(),
+                        self.runtime.pw_adaptive_config.clone(),
                     )?)
                 }
             }
@@ -1207,6 +1314,11 @@ impl DecodeHandler {
             .audio_writer
             .as_ref()
             .and_then(|w| w.measured_audio_delay_ms());
+        let current_latency_control_ms: Option<f32> = self
+            .output
+            .audio_writer
+            .as_ref()
+            .and_then(|w| w.control_audio_delay_ms());
         let current_latency_target_ms: Option<f32> = self
             .output
             .audio_writer
@@ -1217,6 +1329,11 @@ impl DecodeHandler {
             .audio_writer
             .as_ref()
             .and_then(|w| w.resample_ratio());
+        let current_adaptive_band: Option<&'static str> = self
+            .output
+            .audio_writer
+            .as_ref()
+            .and_then(|w| w.adaptive_band());
 
         // Keep /tmp/gsrd_delay updated when total delay drifts enough.
         // Prefer the configured target delay (stable sync reference for mpv),
@@ -1308,8 +1425,10 @@ impl DecodeHandler {
                             &snapshot,
                             &rendered.object_gains,
                             current_latency_instant_ms,
+                            current_latency_control_ms,
                             current_latency_target_ms,
                             current_resample_ratio,
+                            current_adaptive_band,
                         ) {
                             log::warn!("Failed to send meter OSC bundle: {}", e);
                         }
@@ -1408,8 +1527,10 @@ impl DecodeHandler {
                             &snapshot,
                             &rendered.object_gains,
                             current_latency_instant_ms,
+                            current_latency_control_ms,
                             current_latency_target_ms,
                             current_resample_ratio,
+                            current_adaptive_band,
                         ) {
                             log::warn!("Failed to send meter OSC bundle: {}", e);
                         }
@@ -1516,6 +1637,8 @@ impl DecodeHandler {
         if let Some(mut writer) = self.output.audio_writer.take() {
             writer.flush()?;
         }
+        self.output.bootstrap_frames_seen = 0;
+        self.output.bootstrap_started_at = None;
 
         let effective_channel_count = if bed_conform && self.spatial.has_objects {
             let empty_vec = Vec::new();

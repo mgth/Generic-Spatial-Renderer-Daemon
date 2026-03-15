@@ -434,8 +434,10 @@ impl OscSender {
         snapshot: &crate::metering::MeterSnapshot,
         object_gains: &[(usize, Vec<f32>)],
         latency_instant_ms: Option<f32>,
+        latency_control_ms: Option<f32>,
         latency_target_ms: Option<f32>,
         resample_ratio: Option<f32>,
+        adaptive_band: Option<&str>,
     ) -> Result<()> {
         // Build an indexable lookup table once (avoids per-frame HashMap hashing).
         let max_gain_id = object_gains.iter().map(|(idx, _)| *idx).max().unwrap_or(0);
@@ -464,6 +466,12 @@ impl OscSender {
                 args: vec![OscType::Float(ms)],
             }));
         }
+        if let Some(ms) = latency_control_ms {
+            messages.push(OscPacket::Message(OscMessage {
+                addr: "/gsrd/state/latency_control".to_string(),
+                args: vec![OscType::Float(ms)],
+            }));
+        }
         if let Some(ms) = latency_target_ms {
             messages.push(OscPacket::Message(OscMessage {
                 addr: "/gsrd/state/latency_target".to_string(),
@@ -477,6 +485,12 @@ impl OscSender {
             messages.push(OscPacket::Message(OscMessage {
                 addr: "/gsrd/state/resample_ratio".to_string(),
                 args: vec![OscType::Float(ratio)],
+            }));
+        }
+        if let Some(band) = adaptive_band {
+            messages.push(OscPacket::Message(OscMessage {
+                addr: "/gsrd/state/adaptive_resampling/band".to_string(),
+                args: vec![OscType::String(band.to_string())],
             }));
         }
 
@@ -714,6 +728,127 @@ fn handle_control_message(
             clients,
             "/gsrd/state/adaptive_resampling",
             if enabled { 1 } else { 0 },
+        );
+        return;
+    }
+
+    if addr == "/gsrd/control/adaptive_resampling/kp_near" {
+        let value = match msg.args.first() {
+            Some(OscType::Float(f)) if *f > 0.0 => *f,
+            Some(OscType::Int(i)) if *i > 0 => *i as f32,
+            _ => return,
+        };
+        control.set_requested_adaptive_resampling_kp_near(value);
+        set_dirty(control, socket, clients);
+        broadcast_float(socket, clients, "/gsrd/state/adaptive_resampling/kp_near", value);
+        return;
+    }
+
+    if addr == "/gsrd/control/adaptive_resampling/kp_far" {
+        let value = match msg.args.first() {
+            Some(OscType::Float(f)) if *f > 0.0 => *f,
+            Some(OscType::Int(i)) if *i > 0 => *i as f32,
+            _ => return,
+        };
+        control.set_requested_adaptive_resampling_kp_far(value);
+        set_dirty(control, socket, clients);
+        broadcast_float(socket, clients, "/gsrd/state/adaptive_resampling/kp_far", value);
+        return;
+    }
+
+    if addr == "/gsrd/control/adaptive_resampling/ki" {
+        let value = match msg.args.first() {
+            Some(OscType::Float(f)) if *f > 0.0 => *f,
+            Some(OscType::Int(i)) if *i > 0 => *i as f32,
+            _ => return,
+        };
+        control.set_requested_adaptive_resampling_ki(value);
+        set_dirty(control, socket, clients);
+        broadcast_float(socket, clients, "/gsrd/state/adaptive_resampling/ki", value);
+        return;
+    }
+
+    if addr == "/gsrd/control/adaptive_resampling/max_adjust" {
+        let value = match msg.args.first() {
+            Some(OscType::Float(f)) if *f > 0.0 => *f,
+            Some(OscType::Int(i)) if *i > 0 => *i as f32,
+            _ => return,
+        };
+        control.set_requested_adaptive_resampling_max_adjust(value);
+        set_dirty(control, socket, clients);
+        broadcast_float(
+            socket,
+            clients,
+            "/gsrd/state/adaptive_resampling/max_adjust",
+            value,
+        );
+        return;
+    }
+
+    if addr == "/gsrd/control/adaptive_resampling/max_adjust_far" {
+        let value = match msg.args.first() {
+            Some(OscType::Float(f)) if *f > 0.0 => *f,
+            Some(OscType::Int(i)) if *i > 0 => *i as f32,
+            _ => return,
+        };
+        control.set_requested_adaptive_resampling_max_adjust_far(value);
+        set_dirty(control, socket, clients);
+        broadcast_float(
+            socket,
+            clients,
+            "/gsrd/state/adaptive_resampling/max_adjust_far",
+            value,
+        );
+        return;
+    }
+
+    if addr == "/gsrd/control/adaptive_resampling/near_far_threshold_ms" {
+        let value = match msg.args.first() {
+            Some(OscType::Int(i)) if *i > 0 => *i as u32,
+            Some(OscType::Float(f)) if *f > 0.0 => *f as u32,
+            _ => return,
+        };
+        control.set_requested_adaptive_resampling_near_far_threshold_ms(value);
+        set_dirty(control, socket, clients);
+        broadcast_float(
+            socket,
+            clients,
+            "/gsrd/state/adaptive_resampling/near_far_threshold_ms",
+            value as f32,
+        );
+        return;
+    }
+
+    if addr == "/gsrd/control/adaptive_resampling/hard_correction_threshold_ms" {
+        let value = match msg.args.first() {
+            Some(OscType::Int(i)) if *i >= 0 => *i as u32,
+            Some(OscType::Float(f)) if *f >= 0.0 => *f as u32,
+            _ => return,
+        };
+        control.set_requested_adaptive_resampling_hard_correction_threshold_ms(value);
+        set_dirty(control, socket, clients);
+        broadcast_float(
+            socket,
+            clients,
+            "/gsrd/state/adaptive_resampling/hard_correction_threshold_ms",
+            value as f32,
+        );
+        return;
+    }
+
+    if addr == "/gsrd/control/adaptive_resampling/measurement_smoothing_alpha" {
+        let value = match msg.args.first() {
+            Some(OscType::Float(f)) if *f >= 0.0 && *f <= 1.0 => *f,
+            Some(OscType::Int(i)) if *i >= 0 && *i <= 1 => *i as f32,
+            _ => return,
+        };
+        control.set_requested_adaptive_resampling_measurement_smoothing_alpha(value);
+        set_dirty(control, socket, clients);
+        broadcast_float(
+            socket,
+            clients,
+            "/gsrd/state/adaptive_resampling/measurement_smoothing_alpha",
+            value,
         );
         return;
     }
@@ -1679,6 +1814,54 @@ fn build_live_state_bundle(control: &Arc<RendererControl>) -> Vec<u8> {
                 0
             })],
         }),
+        OscPacket::Message(OscMessage {
+            addr: "/gsrd/state/adaptive_resampling/kp_near".to_string(),
+            args: vec![OscType::Float(
+                control.requested_adaptive_resampling_kp_near() as f32,
+            )],
+        }),
+        OscPacket::Message(OscMessage {
+            addr: "/gsrd/state/adaptive_resampling/kp_far".to_string(),
+            args: vec![OscType::Float(
+                control.requested_adaptive_resampling_kp_far() as f32,
+            )],
+        }),
+        OscPacket::Message(OscMessage {
+            addr: "/gsrd/state/adaptive_resampling/ki".to_string(),
+            args: vec![OscType::Float(
+                control.requested_adaptive_resampling_ki() as f32,
+            )],
+        }),
+        OscPacket::Message(OscMessage {
+            addr: "/gsrd/state/adaptive_resampling/max_adjust".to_string(),
+            args: vec![OscType::Float(
+                control.requested_adaptive_resampling_max_adjust() as f32,
+            )],
+        }),
+        OscPacket::Message(OscMessage {
+            addr: "/gsrd/state/adaptive_resampling/max_adjust_far".to_string(),
+            args: vec![OscType::Float(
+                control.requested_adaptive_resampling_max_adjust_far() as f32,
+            )],
+        }),
+        OscPacket::Message(OscMessage {
+            addr: "/gsrd/state/adaptive_resampling/near_far_threshold_ms".to_string(),
+            args: vec![OscType::Float(
+                control.requested_adaptive_resampling_near_far_threshold_ms() as f32,
+            )],
+        }),
+        OscPacket::Message(OscMessage {
+            addr: "/gsrd/state/adaptive_resampling/hard_correction_threshold_ms".to_string(),
+            args: vec![OscType::Float(
+                control.requested_adaptive_resampling_hard_correction_threshold_ms() as f32,
+            )],
+        }),
+        OscPacket::Message(OscMessage {
+            addr: "/gsrd/state/adaptive_resampling/measurement_smoothing_alpha".to_string(),
+            args: vec![OscType::Float(
+                control.requested_adaptive_resampling_measurement_smoothing_alpha() as f32,
+            )],
+        }),
     ];
 
     if let Some(ms) = control.requested_latency_target_ms() {
@@ -2019,6 +2202,21 @@ fn save_live_config(
         Some(false)
     };
     render.pw_latency = control.requested_latency_target_ms();
+    render.adaptive_resampling_kp_near =
+        Some(control.requested_adaptive_resampling_kp_near() as f32);
+    render.adaptive_resampling_kp_far =
+        Some(control.requested_adaptive_resampling_kp_far() as f32);
+    render.adaptive_resampling_ki = Some(control.requested_adaptive_resampling_ki() as f32);
+    render.adaptive_resampling_max_adjust =
+        Some(control.requested_adaptive_resampling_max_adjust() as f32);
+    render.adaptive_resampling_max_adjust_far =
+        Some(control.requested_adaptive_resampling_max_adjust_far() as f32);
+    render.adaptive_resampling_near_far_threshold_ms =
+        Some(control.requested_adaptive_resampling_near_far_threshold_ms());
+    render.adaptive_resampling_hard_correction_threshold_ms =
+        Some(control.requested_adaptive_resampling_hard_correction_threshold_ms());
+    render.adaptive_resampling_measurement_smoothing_alpha =
+        Some(control.requested_adaptive_resampling_measurement_smoothing_alpha() as f32);
 
     drop(live);
 

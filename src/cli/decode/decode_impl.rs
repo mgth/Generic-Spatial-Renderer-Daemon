@@ -4,7 +4,7 @@ use crate::bridge_loader::{LoadedBridge, resolve_bridge_path};
 use crate::cli::command::{Cli, RenderArgs, LogFormat, LogLevel, OutputBackend, VbapTableModeArg};
 use anyhow::Result;
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
-use audio_output::pipewire::PipewireBufferConfig;
+use audio_output::pipewire::{PipewireAdaptiveResamplingConfig, PipewireBufferConfig};
 use log::Level;
 use renderer::metering::AudioMeter;
 use std::sync::mpsc;
@@ -419,6 +419,14 @@ fn effective_to_config(args: &RenderArgs, cli: &Cli) -> Result<renderer::config:
         } else {
             None
         },
+        adaptive_resampling_kp_near: None,
+        adaptive_resampling_kp_far: None,
+        adaptive_resampling_ki: None,
+        adaptive_resampling_max_adjust: None,
+        adaptive_resampling_max_adjust_far: None,
+        adaptive_resampling_near_far_threshold_ms: None,
+        adaptive_resampling_hard_correction_threshold_ms: None,
+        adaptive_resampling_measurement_smoothing_alpha: None,
         output_sample_rate: args.output_sample_rate,
         distance_diffuse: if args.distance_diffuse {
             Some(true)
@@ -631,11 +639,56 @@ fn init_render_handler(
     {
         handler.runtime.sink_target = args.sink.clone();
         let defaults = PipewireBufferConfig::default();
+        let adaptive_defaults = PipewireAdaptiveResamplingConfig::default();
+        let render_cfg = config_path
+            .as_deref()
+            .map(renderer::config::Config::load_or_default)
+            .and_then(|cfg| cfg.render);
         let latency_ms = args.pw_latency.unwrap_or(defaults.latency_ms);
         handler.runtime.pw_buffer_config = PipewireBufferConfig {
             latency_ms,
             max_latency_ms: args.pw_max_latency.unwrap_or(latency_ms * 2),
             quantum_frames: args.pw_quantum.unwrap_or(defaults.quantum_frames),
+        };
+        handler.runtime.pw_adaptive_config = PipewireAdaptiveResamplingConfig {
+            kp_near: render_cfg
+                .as_ref()
+                .and_then(|cfg| cfg.adaptive_resampling_kp_near)
+                .map(|v| v as f64)
+                .unwrap_or(adaptive_defaults.kp_near),
+            kp_far: render_cfg
+                .as_ref()
+                .and_then(|cfg| cfg.adaptive_resampling_kp_far)
+                .map(|v| v as f64)
+                .unwrap_or(adaptive_defaults.kp_far),
+            ki: render_cfg
+                .as_ref()
+                .and_then(|cfg| cfg.adaptive_resampling_ki)
+                .map(|v| v as f64)
+                .unwrap_or(adaptive_defaults.ki),
+            max_adjust: render_cfg
+                .as_ref()
+                .and_then(|cfg| cfg.adaptive_resampling_max_adjust)
+                .map(|v| v as f64)
+                .unwrap_or(adaptive_defaults.max_adjust),
+            max_adjust_far: render_cfg
+                .as_ref()
+                .and_then(|cfg| cfg.adaptive_resampling_max_adjust_far)
+                .map(|v| v as f64)
+                .unwrap_or(adaptive_defaults.max_adjust_far),
+            near_far_threshold_ms: render_cfg
+                .as_ref()
+                .and_then(|cfg| cfg.adaptive_resampling_near_far_threshold_ms)
+                .unwrap_or(adaptive_defaults.near_far_threshold_ms),
+            hard_correction_threshold_ms: render_cfg
+                .as_ref()
+                .and_then(|cfg| cfg.adaptive_resampling_hard_correction_threshold_ms)
+                .unwrap_or(adaptive_defaults.hard_correction_threshold_ms),
+            measurement_smoothing_alpha: render_cfg
+                .as_ref()
+                .and_then(|cfg| cfg.adaptive_resampling_measurement_smoothing_alpha)
+                .map(|v| v as f64)
+                .unwrap_or(adaptive_defaults.measurement_smoothing_alpha),
         };
     }
 
@@ -953,24 +1006,39 @@ fn init_render_handler(
     }
 
     // Wire the renderer control into the OSC sender so the listener can read/write live params.
-    if let (Some(renderer), Some(sender)) =
-        (&handler.spatial_renderer, &mut handler.telemetry.osc_sender)
-    {
+    if let Some(renderer) = &handler.spatial_renderer {
         let ctrl = renderer.renderer_control();
         ctrl.set_requested_output_sample_rate(args.output_sample_rate);
         ctrl.set_requested_adaptive_resampling(args.enable_adaptive_resampling);
         #[cfg(all(target_os = "linux", feature = "pipewire"))]
         {
             let defaults = PipewireBufferConfig::default();
+            let adaptive = &handler.runtime.pw_adaptive_config;
             ctrl.set_requested_latency_target_ms(Some(
                 args.pw_latency.unwrap_or(defaults.latency_ms),
             ));
+            ctrl.set_requested_adaptive_resampling_kp_near(adaptive.kp_near as f32);
+            ctrl.set_requested_adaptive_resampling_kp_far(adaptive.kp_far as f32);
+            ctrl.set_requested_adaptive_resampling_ki(adaptive.ki as f32);
+            ctrl.set_requested_adaptive_resampling_max_adjust(adaptive.max_adjust as f32);
+            ctrl.set_requested_adaptive_resampling_max_adjust_far(adaptive.max_adjust_far as f32);
+            ctrl.set_requested_adaptive_resampling_near_far_threshold_ms(
+                adaptive.near_far_threshold_ms,
+            );
+            ctrl.set_requested_adaptive_resampling_hard_correction_threshold_ms(
+                adaptive.hard_correction_threshold_ms,
+            );
+            ctrl.set_requested_adaptive_resampling_measurement_smoothing_alpha(
+                adaptive.measurement_smoothing_alpha as f32,
+            );
         }
         // Pass the config path so the save-config OSC handler can persist params.
         if let Some(path) = config_path {
             ctrl.set_config_path(path.clone());
         }
-        sender.attach_renderer_control(ctrl);
+        if let Some(sender) = &mut handler.telemetry.osc_sender {
+            sender.attach_renderer_control(ctrl);
+        }
     }
 
     // Start OSC registration listener (active whenever OSC + VBAP are both enabled)

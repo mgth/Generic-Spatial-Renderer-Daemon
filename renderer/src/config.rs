@@ -104,6 +104,22 @@ pub struct RenderConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_adaptive_resampling: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub adaptive_resampling_kp_near: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adaptive_resampling_kp_far: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adaptive_resampling_ki: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adaptive_resampling_max_adjust: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adaptive_resampling_max_adjust_far: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adaptive_resampling_near_far_threshold_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adaptive_resampling_hard_correction_threshold_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adaptive_resampling_measurement_smoothing_alpha: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_sample_rate: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distance_diffuse: Option<bool>,

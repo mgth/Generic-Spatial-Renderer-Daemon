@@ -3,7 +3,10 @@ use bridge_api::{FormatBridgeBox, RInputTransport};
 use spdif::SpdifParser;
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 use sys::InputReader;
+
+const PIPE_STREAM_GAP_RESET_THRESHOLD: Duration = Duration::from_millis(500);
 
 /// Returns the current CLOCK_MONOTONIC timestamp in microseconds.
 /// Used for systemd RELOADING=1 notifications (MONOTONIC_USEC is required by
@@ -75,16 +78,39 @@ pub fn spawn_decoder_thread(config: DecoderThreadConfig) -> thread::JoinHandle<R
             }
 
             let mut input_reader = InputReader::new(&input_path, drain_pipe)?;
+            let is_pipe_input = input_reader.is_pipe();
 
             // S/PDIF demux state — fresh per stream, naturally reset on restart.
             let mut is_spdif: Option<bool> = None;
             let mut spdif_parser = SpdifParser::new();
+            let mut last_chunk_at: Option<Instant> = None;
 
             let mut process_chunk = |chunk: &[u8]| -> Result<bool> {
                 // Secondary check: interrupt the current stream on shutdown or reload.
                 if sys::ShutdownHandle::is_requested() || sys::ShutdownHandle::is_reload_requested()
                 {
                     return Ok(false);
+                }
+
+                let now = Instant::now();
+                if continuous && is_pipe_input {
+                    if let Some(last) = last_chunk_at {
+                        let gap = now.saturating_duration_since(last);
+                        if gap >= PIPE_STREAM_GAP_RESET_THRESHOLD && frame_count > 0 {
+                            log::info!(
+                                "Detected input gap of {:.0} ms on pipe, treating next data as a new stream",
+                                gap.as_secs_f64() * 1000.0
+                            );
+                            if tx.send(Ok(DecoderMessage::StreamEnd)).is_err() {
+                                log::warn!("Failed to send StreamEnd message, receiver closed");
+                                return Ok(false);
+                            }
+                            bridge.reset();
+                            is_spdif = None;
+                            spdif_parser = SpdifParser::new();
+                        }
+                    }
+                    last_chunk_at = Some(now);
                 }
 
                 // Detect transport format on the first chunk.
@@ -122,8 +148,16 @@ pub fn spawn_decoder_thread(config: DecoderThreadConfig) -> thread::JoinHandle<R
                             let _ = tx.send(Err(anyhow::anyhow!("{}", result.error_message)));
                             return Ok(false);
                         }
-                        // Non-strict: flush stale audio and keep going.
-                        let _ = tx.send(Ok(DecoderMessage::FlushRequest));
+                        // Non-strict: keep audio running through transient decoder resets.
+                        // Flushing here turns a recoverable bridge reset into an audible
+                        // dropout that can last much longer than the actual decode hiccup.
+                        if strict_mode {
+                            let _ = tx.send(Ok(DecoderMessage::FlushRequest));
+                        } else {
+                            log::debug!(
+                                "Bridge reset in non-strict mode; keeping audio buffers intact"
+                            );
+                        }
                     }
 
                     for frame in result.frames {

@@ -376,6 +376,16 @@ pub struct RendererControl {
     pub requested_adaptive_resampling: std::sync::atomic::AtomicBool,
     /// Requested output latency target in milliseconds from OSC control (`None` encoded as 0).
     pub requested_latency_target_ms: std::sync::atomic::AtomicU32,
+    /// Requested adaptive-resampling PI tuning from OSC control, encoded as f32 bits.
+    pub requested_adaptive_resampling_kp_near_bits: std::sync::atomic::AtomicU32,
+    pub requested_adaptive_resampling_kp_far_bits: std::sync::atomic::AtomicU32,
+    pub requested_adaptive_resampling_ki_bits: std::sync::atomic::AtomicU32,
+    pub requested_adaptive_resampling_max_adjust_bits: std::sync::atomic::AtomicU32,
+    pub requested_adaptive_resampling_max_adjust_far_bits: std::sync::atomic::AtomicU32,
+    pub requested_adaptive_resampling_near_far_threshold_ms: std::sync::atomic::AtomicU32,
+    pub requested_adaptive_resampling_hard_correction_threshold_ms: std::sync::atomic::AtomicU32,
+    pub requested_adaptive_resampling_measurement_smoothing_alpha_bits:
+        std::sync::atomic::AtomicU32,
 
     /// Current active output sample rate in Hz, as reported by the decode handler.
     pub current_output_sample_rate_hz: std::sync::atomic::AtomicU32,
@@ -408,6 +418,22 @@ impl RendererControl {
             requested_output_sample_rate_hz: std::sync::atomic::AtomicU32::new(0),
             requested_adaptive_resampling: std::sync::atomic::AtomicBool::new(false),
             requested_latency_target_ms: std::sync::atomic::AtomicU32::new(0),
+            requested_adaptive_resampling_kp_near_bits:
+                std::sync::atomic::AtomicU32::new(0),
+            requested_adaptive_resampling_kp_far_bits:
+                std::sync::atomic::AtomicU32::new(0),
+            requested_adaptive_resampling_ki_bits:
+                std::sync::atomic::AtomicU32::new(0),
+            requested_adaptive_resampling_max_adjust_bits:
+                std::sync::atomic::AtomicU32::new(0),
+            requested_adaptive_resampling_max_adjust_far_bits:
+                std::sync::atomic::AtomicU32::new(0),
+            requested_adaptive_resampling_near_far_threshold_ms:
+                std::sync::atomic::AtomicU32::new(0),
+            requested_adaptive_resampling_hard_correction_threshold_ms:
+                std::sync::atomic::AtomicU32::new(0),
+            requested_adaptive_resampling_measurement_smoothing_alpha_bits:
+                std::sync::atomic::AtomicU32::new(0),
             current_output_sample_rate_hz: std::sync::atomic::AtomicU32::new(0),
             current_sample_format: Mutex::new("unknown".to_string()),
         })
@@ -584,6 +610,98 @@ impl RendererControl {
             0 => None,
             v => Some(v),
         }
+    }
+
+    pub fn set_requested_adaptive_resampling_kp_near(&self, value: f32) {
+        self.requested_adaptive_resampling_kp_near_bits
+            .store(value.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn requested_adaptive_resampling_kp_near(&self) -> f64 {
+        f32::from_bits(
+            self.requested_adaptive_resampling_kp_near_bits
+                .load(Ordering::Relaxed),
+        ) as f64
+    }
+
+    pub fn set_requested_adaptive_resampling_kp_far(&self, value: f32) {
+        self.requested_adaptive_resampling_kp_far_bits
+            .store(value.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn requested_adaptive_resampling_kp_far(&self) -> f64 {
+        f32::from_bits(
+            self.requested_adaptive_resampling_kp_far_bits
+                .load(Ordering::Relaxed),
+        ) as f64
+    }
+
+    pub fn set_requested_adaptive_resampling_ki(&self, value: f32) {
+        self.requested_adaptive_resampling_ki_bits
+            .store(value.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn requested_adaptive_resampling_ki(&self) -> f64 {
+        f32::from_bits(
+            self.requested_adaptive_resampling_ki_bits
+                .load(Ordering::Relaxed),
+        ) as f64
+    }
+
+    pub fn set_requested_adaptive_resampling_max_adjust(&self, value: f32) {
+        self.requested_adaptive_resampling_max_adjust_bits
+            .store(value.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn requested_adaptive_resampling_max_adjust(&self) -> f64 {
+        f32::from_bits(
+            self.requested_adaptive_resampling_max_adjust_bits
+                .load(Ordering::Relaxed),
+        ) as f64
+    }
+
+    pub fn set_requested_adaptive_resampling_max_adjust_far(&self, value: f32) {
+        self.requested_adaptive_resampling_max_adjust_far_bits
+            .store(value.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn requested_adaptive_resampling_max_adjust_far(&self) -> f64 {
+        f32::from_bits(
+            self.requested_adaptive_resampling_max_adjust_far_bits
+                .load(Ordering::Relaxed),
+        ) as f64
+    }
+
+    pub fn set_requested_adaptive_resampling_near_far_threshold_ms(&self, value: u32) {
+        self.requested_adaptive_resampling_near_far_threshold_ms
+            .store(value, Ordering::Relaxed);
+    }
+
+    pub fn requested_adaptive_resampling_near_far_threshold_ms(&self) -> u32 {
+        self.requested_adaptive_resampling_near_far_threshold_ms
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn set_requested_adaptive_resampling_hard_correction_threshold_ms(&self, value: u32) {
+        self.requested_adaptive_resampling_hard_correction_threshold_ms
+            .store(value, Ordering::Relaxed);
+    }
+
+    pub fn requested_adaptive_resampling_hard_correction_threshold_ms(&self) -> u32 {
+        self.requested_adaptive_resampling_hard_correction_threshold_ms
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn set_requested_adaptive_resampling_measurement_smoothing_alpha(&self, value: f32) {
+        self.requested_adaptive_resampling_measurement_smoothing_alpha_bits
+            .store(value.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn requested_adaptive_resampling_measurement_smoothing_alpha(&self) -> f64 {
+        f32::from_bits(
+            self.requested_adaptive_resampling_measurement_smoothing_alpha_bits
+                .load(Ordering::Relaxed),
+        ) as f64
     }
 
     pub fn set_audio_state(&self, sample_rate_hz: u32, sample_format: impl Into<String>) {
