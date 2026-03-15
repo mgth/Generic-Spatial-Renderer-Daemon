@@ -182,8 +182,10 @@ render:
 
 ## Related Tools
 
-- [SpatialVisualizer](https://github.com/mgth/SpatialVisualizer): companion
-  visualizer for inspecting spatial metadata and renderer state
+- [SpatialVisualizer](https://github.com/mgth/SpatialVisualizer): companion UI
+  for `gsrd`, used to inspect spatial metadata, monitor renderer state, and
+  send live OSC control changes. `gsrd` provides the realtime decode/render
+  engine; `SpatialVisualizer` is the supervision and control surface on top.
 
 ## License
 
